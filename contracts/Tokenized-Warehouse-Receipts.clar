@@ -294,3 +294,133 @@
 
 (define-read-only (is-receipt-graded (receipt-id uint))
   (is-some (map-get? receipt-grades receipt-id)))
+
+(define-constant err-price-oracle-not-authorized (err u111))
+(define-constant err-invalid-price (err u112))
+(define-constant err-commodity-not-supported (err u113))
+(define-constant err-stale-price (err u114))
+
+(define-map authorized-price-oracles principal bool)
+(define-map commodity-prices (string-ascii 24) {
+    price-per-unit: uint,
+    last-updated: uint,
+    oracle: principal,
+    price-source: (string-ascii 50)
+})
+
+(define-map receipt-valuations uint {
+    estimated-value: uint,
+    valuation-date: uint,
+    price-per-unit: uint
+})
+
+(define-data-var price-staleness-threshold uint u144)
+
+(define-public (authorize-price-oracle (oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (ok (map-set authorized-price-oracles oracle true))))
+
+(define-public (revoke-price-oracle (oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (ok (map-set authorized-price-oracles oracle false))))
+
+(define-read-only (is-price-oracle-authorized (oracle principal))
+  (default-to false (map-get? authorized-price-oracles oracle)))
+
+(define-public (update-commodity-price 
+    (commodity (string-ascii 24))
+    (price-per-unit uint)
+    (price-source (string-ascii 50)))
+  (let ((current-time stacks-block-height))
+    (asserts! (is-price-oracle-authorized tx-sender) err-price-oracle-not-authorized)
+    (asserts! (> price-per-unit u0) err-invalid-price)
+    (map-set commodity-prices commodity {
+        price-per-unit: price-per-unit,
+        last-updated: current-time,
+        oracle: tx-sender,
+        price-source: price-source
+    })
+    (ok true)))
+
+(define-public (calculate-receipt-value (receipt-id uint))
+  (let ((receipt (unwrap! (map-get? receipts receipt-id) err-receipt-not-found))
+        (commodity (get commodity receipt))
+        (quantity (get quantity receipt))
+        (current-time stacks-block-height))
+    (let ((price-data (unwrap! (map-get? commodity-prices commodity) err-commodity-not-supported)))
+      (let ((price-age (- current-time (get last-updated price-data))))
+        (asserts! (<= price-age (var-get price-staleness-threshold)) err-stale-price)
+        (let ((price-per-unit (get price-per-unit price-data))
+              (estimated-value (* quantity price-per-unit)))
+          (map-set receipt-valuations receipt-id {
+              estimated-value: estimated-value,
+              valuation-date: current-time,
+              price-per-unit: price-per-unit
+          })
+          (ok estimated-value))))))
+
+(define-public (batch-update-prices 
+    (price-updates (list 20 {
+        commodity: (string-ascii 24),
+        price-per-unit: uint,
+        price-source: (string-ascii 50)
+    })))
+  (let ((batch-length (len price-updates)))
+    (asserts! (> batch-length u0) err-batch-empty)
+    (asserts! (<= batch-length u20) err-batch-limit-exceeded)
+    (ok (map process-price-update price-updates))))
+
+(define-private (process-price-update (price-data {
+    commodity: (string-ascii 24),
+    price-per-unit: uint,
+    price-source: (string-ascii 50)
+}))
+  (let ((current-time stacks-block-height)
+        (commodity (get commodity price-data))
+        (price-per-unit (get price-per-unit price-data))
+        (price-source (get price-source price-data)))
+    (asserts! (is-price-oracle-authorized tx-sender) err-price-oracle-not-authorized)
+    (asserts! (> price-per-unit u0) err-invalid-price)
+    (map-set commodity-prices commodity {
+        price-per-unit: price-per-unit,
+        last-updated: current-time,
+        oracle: tx-sender,
+        price-source: price-source
+    })
+    (ok commodity)))
+
+(define-public (set-price-staleness-threshold (blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (> blocks u0) err-invalid-amount)
+    (ok (var-set price-staleness-threshold blocks))))
+
+(define-read-only (get-commodity-price (commodity (string-ascii 24)))
+  (map-get? commodity-prices commodity))
+
+(define-read-only (get-receipt-valuation (receipt-id uint))
+  (map-get? receipt-valuations receipt-id))
+
+(define-read-only (is-price-fresh (commodity (string-ascii 24)))
+  (let ((current-time stacks-block-height))
+    (match (map-get? commodity-prices commodity)
+      price-data (let ((price-age (- current-time (get last-updated price-data))))
+                   (<= price-age (var-get price-staleness-threshold)))
+      false)))
+
+(define-read-only (get-portfolio-value (receipt-ids (list 50 uint)))
+  (let ((valuations (map get-individual-receipt-value receipt-ids)))
+    (fold calculate-total-value valuations u0)))
+
+(define-private (get-individual-receipt-value (receipt-id uint))
+  (match (map-get? receipt-valuations receipt-id)
+    valuation (get estimated-value valuation)
+    u0))
+
+(define-private (calculate-total-value (value uint) (total uint))
+  (+ total value))
+
+(define-read-only (get-price-staleness-threshold)
+  (var-get price-staleness-threshold))

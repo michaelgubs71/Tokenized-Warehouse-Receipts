@@ -73,6 +73,7 @@
 (define-public (transfer (id uint) (sender principal) (recipient principal))
     (begin
         (asserts! (is-eq tx-sender sender) err-not-authorized)
+        (asserts! (is-none (map-get? collateralized-receipts id)) err-receipt-collateralized)
         (try! (nft-transfer? warehouse-receipt id sender recipient))
         (let ((receipt (unwrap! (map-get? receipts id) err-receipt-not-found)))
             (ok (map-set receipts id
@@ -424,3 +425,113 @@
 
 (define-read-only (get-price-staleness-threshold)
   (var-get price-staleness-threshold))
+
+(define-constant err-receipt-collateralized (err u115))
+(define-constant err-loan-not-found (err u116))
+(define-constant err-loan-already-repaid (err u117))
+(define-constant err-loan-not-due (err u118))
+(define-constant err-insufficient-payment (err u119))
+(define-constant err-invalid-loan-terms (err u120))
+
+(define-data-var loan-id-nonce uint u0)
+
+(define-map collateralized-receipts uint uint)
+
+(define-map loans uint {
+    borrower: principal,
+    lender: principal,
+    collateral-receipt-id: uint,
+    principal-amount: uint,
+    interest-rate: uint,
+    loan-term: uint,
+    loan-start: uint,
+    repayment-amount: uint,
+    status: (string-ascii 12)
+})
+
+(define-public (collateralize-receipt 
+    (receipt-id uint)
+    (lender principal)
+    (principal-amount uint)
+    (interest-rate uint)
+    (loan-term uint))
+  (let ((receipt (unwrap! (map-get? receipts receipt-id) err-receipt-not-found))
+        (current-time stacks-block-height)
+        (loan-id (var-get loan-id-nonce)))
+    (asserts! (is-eq (get owner receipt) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status receipt) "active") err-not-authorized)
+    (asserts! (is-none (map-get? collateralized-receipts receipt-id)) err-receipt-collateralized)
+    (asserts! (> principal-amount u0) err-invalid-loan-terms)
+    (asserts! (> loan-term u0) err-invalid-loan-terms)
+    (asserts! (<= interest-rate u10000) err-invalid-loan-terms)
+    (let ((repayment-amount (+ principal-amount (/ (* principal-amount interest-rate) u10000))))
+      (map-set collateralized-receipts receipt-id loan-id)
+      (map-set loans loan-id {
+        borrower: tx-sender,
+        lender: lender,
+        collateral-receipt-id: receipt-id,
+        principal-amount: principal-amount,
+        interest-rate: interest-rate,
+        loan-term: loan-term,
+        loan-start: current-time,
+        repayment-amount: repayment-amount,
+        status: "active"
+      })
+      (var-set loan-id-nonce (+ loan-id u1))
+      (ok loan-id))))
+
+(define-public (repay-loan (loan-id uint) (payment-amount uint))
+  (let ((loan (unwrap! (map-get? loans loan-id) err-loan-not-found))
+        (current-time stacks-block-height))
+    (asserts! (is-eq (get borrower loan) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status loan) "active") err-loan-already-repaid)
+    (asserts! (>= payment-amount (get repayment-amount loan)) err-insufficient-payment)
+    (let ((collateral-receipt-id (get collateral-receipt-id loan)))
+      (map-delete collateralized-receipts collateral-receipt-id)
+      (map-set loans loan-id
+        (merge loan { status: "repaid" }))
+      (ok true))))
+
+(define-public (claim-collateral (loan-id uint))
+  (let ((loan (unwrap! (map-get? loans loan-id) err-loan-not-found))
+        (current-time stacks-block-height))
+    (asserts! (is-eq (get lender loan) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status loan) "active") err-loan-already-repaid)
+    (let ((loan-end (+ (get loan-start loan) (get loan-term loan)))
+          (collateral-receipt-id (get collateral-receipt-id loan))
+          (receipt (unwrap! (map-get? receipts collateral-receipt-id) err-receipt-not-found)))
+      (asserts! (> current-time loan-end) err-loan-not-due)
+      (try! (nft-transfer? warehouse-receipt collateral-receipt-id (get borrower loan) tx-sender))
+      (map-delete collateralized-receipts collateral-receipt-id)
+      (map-set receipts collateral-receipt-id
+        (merge receipt { owner: tx-sender }))
+      (map-set loans loan-id
+        (merge loan { status: "defaulted" }))
+      (ok true))))
+
+(define-read-only (is-receipt-collateralized (receipt-id uint))
+  (is-some (map-get? collateralized-receipts receipt-id)))
+
+(define-read-only (get-loan-by-id (loan-id uint))
+  (map-get? loans loan-id))
+
+(define-read-only (get-loan-by-receipt (receipt-id uint))
+  (match (map-get? collateralized-receipts receipt-id)
+    loan-id (map-get? loans loan-id)
+    none))
+
+(define-read-only (is-loan-overdue (loan-id uint))
+  (match (map-get? loans loan-id)
+    loan (let ((current-time stacks-block-height)
+               (loan-end (+ (get loan-start loan) (get loan-term loan))))
+           (and (is-eq (get status loan) "active")
+                (> current-time loan-end)))
+    false))
+
+(define-read-only (calculate-loan-value (loan-id uint))
+  (match (map-get? loans loan-id)
+    loan (let ((collateral-receipt-id (get collateral-receipt-id loan)))
+           (match (map-get? receipt-valuations collateral-receipt-id)
+             valuation (get estimated-value valuation)
+             u0))
+    u0))

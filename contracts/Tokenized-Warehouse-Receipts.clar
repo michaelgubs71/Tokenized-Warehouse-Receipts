@@ -535,3 +535,180 @@
              valuation (get estimated-value valuation)
              u0))
     u0))
+
+(define-constant err-margin-call-exists (err u121))
+(define-constant err-margin-call-not-found (err u122))
+(define-constant err-insufficient-collateral-value (err u123))
+(define-constant err-ltv-healthy (err u124))
+
+(define-data-var margin-call-threshold uint u8000)
+(define-data-var liquidation-threshold uint u9000)
+
+(define-map margin-calls uint {
+    loan-id: uint,
+    issued-by: principal,
+    issued-at: uint,
+    current-ltv: uint,
+    required-value: uint,
+    status: (string-ascii 12)
+})
+
+(define-map additional-collateral uint (list 10 uint))
+
+(define-public (set-margin-call-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (and (> new-threshold u0) (<= new-threshold u10000)) err-invalid-loan-terms)
+    (ok (var-set margin-call-threshold new-threshold))))
+
+(define-public (set-liquidation-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (and (> new-threshold u0) (<= new-threshold u10000)) err-invalid-loan-terms)
+    (ok (var-set liquidation-threshold new-threshold))))
+
+(define-public (issue-margin-call (loan-id uint))
+  (let ((loan (unwrap! (map-get? loans loan-id) err-loan-not-found))
+        (current-time stacks-block-height))
+    (asserts! (is-eq (get lender loan) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status loan) "active") err-loan-already-repaid)
+    (asserts! (is-none (map-get? margin-calls loan-id)) err-margin-call-exists)
+    (let ((collateral-receipt-id (get collateral-receipt-id loan))
+          (collateral-value (match (map-get? receipt-valuations collateral-receipt-id)
+                              valuation (get estimated-value valuation)
+                              u0))
+          (debt-amount (get repayment-amount loan))
+          (current-ltv (if (> collateral-value u0)
+                         (/ (* debt-amount u10000) collateral-value)
+                         u10000)))
+      (asserts! (> current-ltv (var-get margin-call-threshold)) err-ltv-healthy)
+      (let ((required-value (/ (* debt-amount u10000) (var-get margin-call-threshold))))
+        (map-set margin-calls loan-id {
+          loan-id: loan-id,
+          issued-by: tx-sender,
+          issued-at: current-time,
+          current-ltv: current-ltv,
+          required-value: required-value,
+          status: "pending"
+        })
+        (ok current-ltv)))))
+
+(define-public (add-collateral-to-loan (loan-id uint) (additional-receipt-ids (list 10 uint)))
+  (let ((loan (unwrap! (map-get? loans loan-id) err-loan-not-found))
+        (margin-call (unwrap! (map-get? margin-calls loan-id) err-margin-call-not-found))
+        (current-time stacks-block-height))
+    (asserts! (is-eq (get borrower loan) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status loan) "active") err-loan-already-repaid)
+    (asserts! (is-eq (get status margin-call) "pending") err-not-authorized)
+    (try! (validate-additional-receipts additional-receipt-ids))
+    (let ((total-additional-value (calculate-receipts-total-value additional-receipt-ids))
+          (primary-collateral-id (get collateral-receipt-id loan))
+          (primary-value (match (map-get? receipt-valuations primary-collateral-id)
+                           valuation (get estimated-value valuation)
+                           u0))
+          (total-collateral-value (+ primary-value total-additional-value))
+          (debt-amount (get repayment-amount loan))
+          (new-ltv (if (> total-collateral-value u0)
+                     (/ (* debt-amount u10000) total-collateral-value)
+                     u10000)))
+      (asserts! (<= new-ltv (var-get margin-call-threshold)) err-insufficient-collateral-value)
+      (map-set additional-collateral loan-id additional-receipt-ids)
+      (map lock-single-receipt-to-loan additional-receipt-ids)
+      (map-set margin-calls loan-id
+        (merge margin-call { status: "resolved" }))
+      (ok new-ltv))))
+
+(define-public (force-liquidate (loan-id uint))
+  (let ((loan (unwrap! (map-get? loans loan-id) err-loan-not-found))
+        (current-time stacks-block-height))
+    (asserts! (is-eq (get lender loan) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status loan) "active") err-loan-already-repaid)
+    (let ((collateral-receipt-id (get collateral-receipt-id loan))
+          (collateral-value (match (map-get? receipt-valuations collateral-receipt-id)
+                              valuation (get estimated-value valuation)
+                              u0))
+          (debt-amount (get repayment-amount loan))
+          (current-ltv (if (> collateral-value u0)
+                         (/ (* debt-amount u10000) collateral-value)
+                         u10000)))
+      (asserts! (> current-ltv (var-get liquidation-threshold)) err-ltv-healthy)
+      (let ((receipt (unwrap! (map-get? receipts collateral-receipt-id) err-receipt-not-found)))
+        (try! (nft-transfer? warehouse-receipt collateral-receipt-id (get borrower loan) tx-sender))
+        (map-delete collateralized-receipts collateral-receipt-id)
+        (map-set receipts collateral-receipt-id
+          (merge receipt { owner: tx-sender }))
+        (map-set loans loan-id
+          (merge loan { status: "liquidated" }))
+        (match (map-get? additional-collateral loan-id)
+          additional-receipts (begin
+            (map-delete additional-collateral loan-id)
+            (ok true))
+          (ok true))))))
+
+(define-private (validate-additional-receipts (receipt-ids (list 10 uint)))
+  (fold validate-and-accumulate receipt-ids (ok true)))
+
+(define-private (validate-and-accumulate (receipt-id uint) (previous-result (response bool uint)))
+  (match previous-result
+    success (let ((receipt (unwrap! (map-get? receipts receipt-id) err-receipt-not-found)))
+              (asserts! (is-eq (get owner receipt) tx-sender) err-not-authorized)
+              (asserts! (is-none (map-get? collateralized-receipts receipt-id)) err-receipt-collateralized)
+              (ok true))
+    error-value (err error-value)))
+
+(define-private (calculate-receipts-total-value (receipt-ids (list 10 uint)))
+  (fold add-receipt-value receipt-ids u0))
+
+(define-private (add-receipt-value (receipt-id uint) (total uint))
+  (match (map-get? receipt-valuations receipt-id)
+    valuation (+ total (get estimated-value valuation))
+    total))
+
+(define-private (lock-additional-receipts (receipt-ids (list 10 uint)) (loan-id uint))
+  (begin
+    (map lock-single-receipt-to-loan receipt-ids)
+    (ok true)))
+
+(define-private (lock-single-receipt-to-loan (receipt-id uint))
+  (map-set collateralized-receipts receipt-id u0))
+
+(define-read-only (get-margin-call (loan-id uint))
+  (map-get? margin-calls loan-id))
+
+(define-read-only (calculate-current-ltv (loan-id uint))
+  (match (map-get? loans loan-id)
+    loan (let ((collateral-receipt-id (get collateral-receipt-id loan))
+               (collateral-value (match (map-get? receipt-valuations collateral-receipt-id)
+                                   valuation (get estimated-value valuation)
+                                   u0))
+               (additional-value (match (map-get? additional-collateral loan-id)
+                                   additional-receipts (calculate-receipts-total-value additional-receipts)
+                                   u0))
+               (total-collateral-value (+ collateral-value additional-value))
+               (debt-amount (get repayment-amount loan)))
+           (if (> total-collateral-value u0)
+             (ok (/ (* debt-amount u10000) total-collateral-value))
+             (ok u10000)))
+    err-loan-not-found))
+
+(define-read-only (is-margin-call-required (loan-id uint))
+  (match (map-get? loans loan-id)
+    loan (let ((collateral-receipt-id (get collateral-receipt-id loan))
+               (collateral-value (match (map-get? receipt-valuations collateral-receipt-id)
+                                   valuation (get estimated-value valuation)
+                                   u0))
+               (debt-amount (get repayment-amount loan))
+               (current-ltv (if (> collateral-value u0)
+                              (/ (* debt-amount u10000) collateral-value)
+                              u10000)))
+           (> current-ltv (var-get margin-call-threshold)))
+    false))
+
+(define-read-only (get-additional-collateral (loan-id uint))
+  (map-get? additional-collateral loan-id))
+
+(define-read-only (get-margin-call-threshold)
+  (var-get margin-call-threshold))
+
+(define-read-only (get-liquidation-threshold)
+  (var-get liquidation-threshold))

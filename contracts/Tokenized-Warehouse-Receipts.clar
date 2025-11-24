@@ -712,3 +712,129 @@
 
 (define-read-only (get-liquidation-threshold)
   (var-get liquidation-threshold))
+
+(define-constant err-receipt-fractionalized (err u125))
+(define-constant err-insufficient-shares (err u126))
+(define-constant err-invalid-shares (err u127))
+(define-constant err-not-fractionalized (err u128))
+(define-constant err-voting-closed (err u129))
+(define-constant err-already-voted (err u130))
+(define-constant err-voting-failed (err u131))
+
+(define-map fractionalized-receipts uint {
+    total-shares: uint,
+    is-fractionalized: bool,
+    voting-threshold: uint
+})
+
+(define-map share-balances {receipt-id: uint, owner: principal} uint)
+
+(define-map release-votes uint {
+    yes-votes: uint,
+    no-votes: uint,
+    voting-open: bool,
+    vote-deadline: uint
+})
+
+(define-map voter-records {receipt-id: uint, voter: principal} bool)
+
+(define-public (fractionalize-receipt (receipt-id uint) (total-shares uint) (voting-threshold uint))
+  (let ((receipt (unwrap! (map-get? receipts receipt-id) err-receipt-not-found)))
+    (asserts! (is-eq (get owner receipt) tx-sender) err-not-authorized)
+    (asserts! (is-eq (get status receipt) "active") err-not-authorized)
+    (asserts! (is-none (map-get? collateralized-receipts receipt-id)) err-receipt-collateralized)
+    (asserts! (is-none (map-get? fractionalized-receipts receipt-id)) err-receipt-fractionalized)
+    (asserts! (> total-shares u1) err-invalid-shares)
+    (asserts! (and (> voting-threshold u0) (<= voting-threshold u10000)) err-invalid-shares)
+    (map-set fractionalized-receipts receipt-id {
+        total-shares: total-shares,
+        is-fractionalized: true,
+        voting-threshold: voting-threshold
+    })
+    (map-set share-balances {receipt-id: receipt-id, owner: tx-sender} total-shares)
+    (ok true)))
+
+(define-public (transfer-shares (receipt-id uint) (recipient principal) (amount uint))
+  (let ((fractional-data (unwrap! (map-get? fractionalized-receipts receipt-id) err-not-fractionalized))
+        (sender-balance (default-to u0 (map-get? share-balances {receipt-id: receipt-id, owner: tx-sender}))))
+    (asserts! (get is-fractionalized fractional-data) err-not-fractionalized)
+    (asserts! (> amount u0) err-invalid-shares)
+    (asserts! (>= sender-balance amount) err-insufficient-shares)
+    (let ((new-sender-balance (- sender-balance amount))
+          (recipient-balance (default-to u0 (map-get? share-balances {receipt-id: receipt-id, owner: recipient})))
+          (new-recipient-balance (+ recipient-balance amount)))
+      (map-set share-balances {receipt-id: receipt-id, owner: tx-sender} new-sender-balance)
+      (map-set share-balances {receipt-id: receipt-id, owner: recipient} new-recipient-balance)
+      (ok true))))
+
+(define-public (initiate-release-vote (receipt-id uint) (voting-period uint))
+  (let ((fractional-data (unwrap! (map-get? fractionalized-receipts receipt-id) err-not-fractionalized))
+        (current-time stacks-block-height))
+    (asserts! (get is-fractionalized fractional-data) err-not-fractionalized)
+    (asserts! (is-none (map-get? release-votes receipt-id)) err-already-graded)
+    (asserts! (> voting-period u0) err-invalid-amount)
+    (map-set release-votes receipt-id {
+        yes-votes: u0,
+        no-votes: u0,
+        voting-open: true,
+        vote-deadline: (+ current-time voting-period)
+    })
+    (ok true)))
+
+(define-public (vote-on-release (receipt-id uint) (vote-yes bool))
+  (let ((fractional-data (unwrap! (map-get? fractionalized-receipts receipt-id) err-not-fractionalized))
+        (vote-data (unwrap! (map-get? release-votes receipt-id) err-margin-call-not-found))
+        (current-time stacks-block-height)
+        (share-balance (default-to u0 (map-get? share-balances {receipt-id: receipt-id, owner: tx-sender}))))
+    (asserts! (get voting-open vote-data) err-voting-closed)
+    (asserts! (< current-time (get vote-deadline vote-data)) err-voting-closed)
+    (asserts! (is-none (map-get? voter-records {receipt-id: receipt-id, voter: tx-sender})) err-already-voted)
+    (asserts! (> share-balance u0) err-insufficient-shares)
+    (map-set voter-records {receipt-id: receipt-id, voter: tx-sender} true)
+    (let ((new-yes-votes (if vote-yes (+ (get yes-votes vote-data) share-balance) (get yes-votes vote-data)))
+          (new-no-votes (if vote-yes (get no-votes vote-data) (+ (get no-votes vote-data) share-balance))))
+      (map-set release-votes receipt-id
+        (merge vote-data {
+            yes-votes: new-yes-votes,
+            no-votes: new-no-votes
+        }))
+      (ok true))))
+
+(define-public (execute-fractional-release (receipt-id uint))
+  (let ((fractional-data (unwrap! (map-get? fractionalized-receipts receipt-id) err-not-fractionalized))
+        (vote-data (unwrap! (map-get? release-votes receipt-id) err-margin-call-not-found))
+        (receipt (unwrap! (map-get? receipts receipt-id) err-receipt-not-found))
+        (current-time stacks-block-height))
+    (asserts! (get is-fractionalized fractional-data) err-not-fractionalized)
+    (asserts! (or (not (get voting-open vote-data)) (> current-time (get vote-deadline vote-data))) err-voting-closed)
+    (let ((total-votes (+ (get yes-votes vote-data) (get no-votes vote-data)))
+          (yes-percentage (if (> total-votes u0) (/ (* (get yes-votes vote-data) u10000) total-votes) u0)))
+      (asserts! (>= yes-percentage (get voting-threshold fractional-data)) err-voting-failed)
+      (asserts! (< current-time (get expiry-date receipt)) err-expired-receipt)
+      (try! (nft-burn? warehouse-receipt receipt-id (get owner receipt)))
+      (map-set receipts receipt-id
+        (merge receipt { status: "released" }))
+      (map-set release-votes receipt-id
+        (merge vote-data { voting-open: false }))
+      (var-set total-receipts (- (var-get total-receipts) u1))
+      (ok true))))
+
+(define-read-only (get-share-balance (receipt-id uint) (owner principal))
+  (ok (default-to u0 (map-get? share-balances {receipt-id: receipt-id, owner: owner}))))
+
+(define-read-only (get-fractional-data (receipt-id uint))
+  (map-get? fractionalized-receipts receipt-id))
+
+(define-read-only (get-release-vote-status (receipt-id uint))
+  (map-get? release-votes receipt-id))
+
+(define-read-only (has-voted (receipt-id uint) (voter principal))
+  (is-some (map-get? voter-records {receipt-id: receipt-id, voter: voter})))
+
+(define-read-only (calculate-vote-result (receipt-id uint))
+  (match (map-get? release-votes receipt-id)
+    vote-data (let ((total-votes (+ (get yes-votes vote-data) (get no-votes vote-data))))
+                (if (> total-votes u0)
+                  (ok (/ (* (get yes-votes vote-data) u10000) total-votes))
+                  (ok u0)))
+    err-margin-call-not-found))
